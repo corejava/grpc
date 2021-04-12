@@ -54,9 +54,10 @@ class HttpConnectHandshaker : public Handshaker {
   const char* name() const override { return "http_connect"; }
 
  private:
-  virtual ~HttpConnectHandshaker();
-  void CleanupArgsForFailureLocked();
-  void HandshakeFailedLocked(grpc_error* error);
+  ~HttpConnectHandshaker() override;
+  void CleanupArgsForFailureLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void HandshakeFailedLocked(grpc_error* error)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   static void OnWriteDone(void* arg, grpc_error* error);
   static void OnReadDone(void* arg, grpc_error* error);
   static void OnWriteDoneScheduler(void* arg, grpc_error* error);
@@ -64,21 +65,21 @@ class HttpConnectHandshaker : public Handshaker {
 
   Mutex mu_;
 
-  bool is_shutdown_ = false;
+  bool is_shutdown_ ABSL_GUARDED_BY(mu_) = false;
   // Endpoint and read buffer to destroy after a shutdown.
-  grpc_endpoint* endpoint_to_destroy_ = nullptr;
-  grpc_slice_buffer* read_buffer_to_destroy_ = nullptr;
+  grpc_endpoint* endpoint_to_destroy_ ABSL_GUARDED_BY(mu_) = nullptr;
+  grpc_slice_buffer* read_buffer_to_destroy_ ABSL_GUARDED_BY(mu_) = nullptr;
 
   // State saved while performing the handshake.
   HandshakerArgs* args_ = nullptr;
   grpc_closure* on_handshake_done_ = nullptr;
 
   // Objects for processing the HTTP CONNECT request and response.
-  grpc_slice_buffer write_buffer_;
-  grpc_closure request_done_closure_;
-  grpc_closure response_read_closure_;
-  grpc_http_parser http_parser_;
-  grpc_http_response http_response_;
+  grpc_slice_buffer write_buffer_ ABSL_GUARDED_BY(mu_);
+  grpc_closure request_done_closure_ ABSL_GUARDED_BY(mu_);
+  grpc_closure response_read_closure_ ABSL_GUARDED_BY(mu_);
+  grpc_http_parser http_parser_ ABSL_GUARDED_BY(mu_);
+  grpc_http_response http_response_ ABSL_GUARDED_BY(mu_);
 };
 
 HttpConnectHandshaker::~HttpConnectHandshaker() {
@@ -151,7 +152,7 @@ void HttpConnectHandshaker::OnWriteDone(void* arg, grpc_error* error) {
     // If the write failed or we're shutting down, clean up and invoke the
     // callback with the error.
     handshaker->HandshakeFailedLocked(GRPC_ERROR_REF(error));
-    lock.Unlock();
+    lock.Release();
     handshaker->Unref();
   } else {
     // Otherwise, read the response.
@@ -256,7 +257,7 @@ done:
   // Set shutdown to true so that subsequent calls to
   // http_connect_handshaker_shutdown() do nothing.
   handshaker->is_shutdown_ = true;
-  lock.Unlock();
+  lock.Release();
   handshaker->Unref();
 }
 
@@ -325,15 +326,14 @@ void HttpConnectHandshaker::DoHandshake(grpc_tcp_server_acceptor* /*acceptor*/,
   args_ = args;
   on_handshake_done_ = on_handshake_done;
   // Log connection via proxy.
-  char* proxy_name = grpc_endpoint_get_peer(args->endpoint);
+  std::string proxy_name(grpc_endpoint_get_peer(args->endpoint));
   gpr_log(GPR_INFO, "Connecting to server %s via HTTP proxy %s", server_name,
-          proxy_name);
-  gpr_free(proxy_name);
+          proxy_name.c_str());
   // Construct HTTP CONNECT request.
   grpc_httpcli_request request;
   request.host = server_name;
   request.ssl_host_override = nullptr;
-  request.http.method = (char*)"CONNECT";
+  request.http.method = const_cast<char*>("CONNECT");
   request.http.path = server_name;
   request.http.version = GRPC_HTTP_HTTP10;  // Set by OnReadDone
   request.http.hdrs = headers;
@@ -383,8 +383,7 @@ class HttpConnectHandshakerFactory : public HandshakerFactory {
 }  // namespace grpc_core
 
 void grpc_http_connect_register_handshaker_factory() {
-  using namespace grpc_core;
-  HandshakerRegistry::RegisterHandshakerFactory(
-      true /* at_start */, HANDSHAKER_CLIENT,
-      absl::make_unique<HttpConnectHandshakerFactory>());
+  grpc_core::HandshakerRegistry::RegisterHandshakerFactory(
+      true /* at_start */, grpc_core::HANDSHAKER_CLIENT,
+      absl::make_unique<grpc_core::HttpConnectHandshakerFactory>());
 }

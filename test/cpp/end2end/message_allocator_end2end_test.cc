@@ -58,7 +58,7 @@ class CallbackTestServiceImpl
       std::function<void(experimental::RpcAllocatorState* allocator_state,
                          const EchoRequest* req, EchoResponse* resp)>
           mutator) {
-    allocator_mutator_ = mutator;
+    allocator_mutator_ = std::move(mutator);
   }
 
   experimental::ServerUnaryReactor* Echo(
@@ -108,7 +108,7 @@ class MessageAllocatorEnd2endTestBase
  protected:
   MessageAllocatorEnd2endTestBase() { GetParam().Log(); }
 
-  ~MessageAllocatorEnd2endTestBase() = default;
+  ~MessageAllocatorEnd2endTestBase() override = default;
 
   void CreateServer(
       experimental::MessageAllocator<EchoRequest, EchoResponse>* allocator) {
@@ -405,5 +405,6 @@ INSTANTIATE_TEST_SUITE_P(ArenaAllocatorTest, ArenaAllocatorTest,
 int main(int argc, char** argv) {
   grpc::testing::TestEnvironment env(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+  int ret = RUN_ALL_TESTS();
+  return ret;
 }

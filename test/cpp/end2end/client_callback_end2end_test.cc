@@ -34,6 +34,7 @@
 #include <sstream>
 #include <thread>
 
+#include "absl/memory/memory.h"
 #include "src/core/lib/gpr/env.h"
 #include "src/core/lib/iomgr/iomgr.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
@@ -108,11 +109,10 @@ class ClientCallbackEnd2endTest
       std::vector<
           std::unique_ptr<experimental::ServerInterceptorFactoryInterface>>
           creators;
-      // Add 20 dummy server interceptors
+      // Add 20 phony server interceptors
       creators.reserve(20);
       for (auto i = 0; i < 20; i++) {
-        creators.push_back(std::unique_ptr<DummyInterceptorFactory>(
-            new DummyInterceptorFactory()));
+        creators.push_back(absl::make_unique<PhonyInterceptorFactory>());
       }
       builder.experimental().SetInterceptorCreators(std::move(creators));
     }
@@ -133,7 +133,7 @@ class ClientCallbackEnd2endTest
         } else {
           channel_ = CreateCustomChannelWithInterceptors(
               server_address_.str(), channel_creds, args,
-              CreateDummyClientInterceptors());
+              CreatePhonyClientInterceptors());
         }
         break;
       case Protocol::INPROC:
@@ -141,15 +141,15 @@ class ClientCallbackEnd2endTest
           channel_ = server_->InProcessChannel(args);
         } else {
           channel_ = server_->experimental().InProcessChannelWithInterceptors(
-              args, CreateDummyClientInterceptors());
+              args, CreatePhonyClientInterceptors());
         }
         break;
       default:
         assert(false);
     }
     stub_ = grpc::testing::EchoTestService::NewStub(channel_);
-    generic_stub_.reset(new GenericStub(channel_));
-    DummyInterceptor::Reset();
+    generic_stub_ = absl::make_unique<GenericStub>(channel_);
+    PhonyInterceptor::Reset();
   }
 
   void TearDown() override {
@@ -212,36 +212,6 @@ class ClientCallbackEnd2endTest
     }
   }
 
-  void SendRpcsRawReq(int num_rpcs) {
-    std::string test_string("Hello raw world.");
-    EchoRequest request;
-    request.set_message(test_string);
-    std::unique_ptr<ByteBuffer> send_buf = SerializeToByteBuffer(&request);
-
-    for (int i = 0; i < num_rpcs; i++) {
-      EchoResponse response;
-      ClientContext cli_ctx;
-
-      std::mutex mu;
-      std::condition_variable cv;
-      bool done = false;
-      stub_->experimental_async()->Echo(
-          &cli_ctx, send_buf.get(), &response,
-          [&request, &response, &done, &mu, &cv](Status s) {
-            GPR_ASSERT(s.ok());
-
-            EXPECT_EQ(request.message(), response.message());
-            std::lock_guard<std::mutex> l(mu);
-            done = true;
-            cv.notify_one();
-          });
-      std::unique_lock<std::mutex> l(mu);
-      while (!done) {
-        cv.wait(l);
-      }
-    }
-  }
-
   void SendRpcsGeneric(int num_rpcs, bool maybe_except) {
     const std::string kMethodName("/grpc.testing.EchoTestService/Echo");
     std::string test_string("");
@@ -271,7 +241,7 @@ class ClientCallbackEnd2endTest
             cv.notify_one();
 #if GRPC_ALLOW_EXCEPTIONS
             if (maybe_except) {
-              throw - 1;
+              throw -1;
             }
 #else
             GPR_ASSERT(!maybe_except);
@@ -297,7 +267,7 @@ class ClientCallbackEnd2endTest
             : reuses_remaining_(reuses), do_writes_done_(do_writes_done) {
           activate_ = [this, test, method_name, test_str] {
             if (reuses_remaining_ > 0) {
-              cli_ctx_.reset(new ClientContext);
+              cli_ctx_ = absl::make_unique<ClientContext>();
               reuses_remaining_--;
               test->generic_stub_->experimental().PrepareBidiStreamingCall(
                   cli_ctx_.get(), method_name, this);
@@ -404,51 +374,61 @@ TEST_P(ClientCallbackEnd2endTest, SimpleRpcExpectedError) {
 
 TEST_P(ClientCallbackEnd2endTest, SimpleRpcUnderLockNested) {
   ResetStub();
-  std::mutex mu1, mu2, mu3;
-  std::condition_variable cv;
-  bool done = false;
-  EchoRequest request1, request2, request3;
-  request1.set_message("Hello locked world1.");
-  request2.set_message("Hello locked world2.");
-  request3.set_message("Hello locked world3.");
-  EchoResponse response1, response2, response3;
-  ClientContext cli_ctx1, cli_ctx2, cli_ctx3;
-  {
-    std::lock_guard<std::mutex> l(mu1);
-    stub_->experimental_async()->Echo(
-        &cli_ctx1, &request1, &response1,
-        [this, &mu1, &mu2, &mu3, &cv, &done, &request1, &request2, &request3,
-         &response1, &response2, &response3, &cli_ctx2, &cli_ctx3](Status s1) {
-          std::lock_guard<std::mutex> l1(mu1);
-          EXPECT_TRUE(s1.ok());
-          EXPECT_EQ(request1.message(), response1.message());
-          // start the second level of nesting
-          std::unique_lock<std::mutex> l2(mu2);
-          this->stub_->experimental_async()->Echo(
-              &cli_ctx2, &request2, &response2,
-              [this, &mu2, &mu3, &cv, &done, &request2, &request3, &response2,
-               &response3, &cli_ctx3](Status s2) {
-                std::lock_guard<std::mutex> l2(mu2);
-                EXPECT_TRUE(s2.ok());
-                EXPECT_EQ(request2.message(), response2.message());
-                // start the third level of nesting
-                std::lock_guard<std::mutex> l3(mu3);
-                stub_->experimental_async()->Echo(
-                    &cli_ctx3, &request3, &response3,
-                    [&mu3, &cv, &done, &request3, &response3](Status s3) {
-                      std::lock_guard<std::mutex> l(mu3);
-                      EXPECT_TRUE(s3.ok());
-                      EXPECT_EQ(request3.message(), response3.message());
-                      done = true;
-                      cv.notify_all();
-                    });
-              });
-        });
+
+  // The request/response state associated with an RPC and the synchronization
+  // variables needed to notify its completion.
+  struct RpcState {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    EchoRequest request;
+    EchoResponse response;
+    ClientContext cli_ctx;
+
+    RpcState() = default;
+    ~RpcState() {
+      // Grab the lock to prevent destruction while another is still holding
+      // lock
+      std::lock_guard<std::mutex> lock(mu);
+    }
+  };
+  std::vector<RpcState> rpc_state(3);
+  for (size_t i = 0; i < rpc_state.size(); i++) {
+    std::string message = "Hello locked world";
+    message += std::to_string(i);
+    rpc_state[i].request.set_message(message);
   }
 
-  std::unique_lock<std::mutex> l(mu3);
-  while (!done) {
-    cv.wait(l);
+  // Grab a lock and then start an RPC whose callback grabs the same lock and
+  // then calls this function to start the next RPC under lock (up to a limit of
+  // the size of the rpc_state vector).
+  std::function<void(int)> nested_call = [this, &nested_call,
+                                          &rpc_state](int index) {
+    std::lock_guard<std::mutex> l(rpc_state[index].mu);
+    stub_->experimental_async()->Echo(
+        &rpc_state[index].cli_ctx, &rpc_state[index].request,
+        &rpc_state[index].response,
+        [index, &nested_call, &rpc_state](Status s) {
+          std::lock_guard<std::mutex> l1(rpc_state[index].mu);
+          EXPECT_TRUE(s.ok());
+          rpc_state[index].done = true;
+          rpc_state[index].cv.notify_all();
+          // Call the next level of nesting if possible
+          if (index + 1 < int(rpc_state.size())) {
+            nested_call(index + 1);
+          }
+        });
+  };
+
+  nested_call(0);
+
+  // Wait for completion notifications from all RPCs. Order doesn't matter.
+  for (RpcState& state : rpc_state) {
+    std::unique_lock<std::mutex> l(state.mu);
+    while (!state.done) {
+      state.cv.wait(l);
+    }
+    EXPECT_EQ(state.request.message(), state.response.message());
   }
 }
 
@@ -482,11 +462,6 @@ TEST_P(ClientCallbackEnd2endTest, SimpleRpcUnderLock) {
 TEST_P(ClientCallbackEnd2endTest, SequentialRpcs) {
   ResetStub();
   SendRpcs(10, false);
-}
-
-TEST_P(ClientCallbackEnd2endTest, SequentialRpcsRawReq) {
-  ResetStub();
-  SendRpcsRawReq(10);
 }
 
 TEST_P(ClientCallbackEnd2endTest, SendClientInitialMetadata) {
@@ -600,7 +575,7 @@ TEST_P(ClientCallbackEnd2endTest, CancelRpcBeforeStart) {
     cv.wait(l);
   }
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -740,7 +715,7 @@ TEST_P(ClientCallbackEnd2endTest, RequestStream) {
   test.Await();
   // Make sure that the server interceptors were not notified to cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -750,7 +725,7 @@ TEST_P(ClientCallbackEnd2endTest, ClientCancelsRequestStream) {
   test.Await();
   // Make sure that the server interceptors got the cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -761,7 +736,7 @@ TEST_P(ClientCallbackEnd2endTest, RequestStreamServerCancelBeforeReads) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -772,7 +747,7 @@ TEST_P(ClientCallbackEnd2endTest, RequestStreamServerCancelDuringRead) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -784,7 +759,7 @@ TEST_P(ClientCallbackEnd2endTest, RequestStreamServerCancelAfterReads) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -792,7 +767,7 @@ TEST_P(ClientCallbackEnd2endTest, UnaryReactor) {
   ResetStub();
   class UnaryClient : public grpc::experimental::ClientUnaryReactor {
    public:
-    UnaryClient(grpc::testing::EchoTestService::Stub* stub) {
+    explicit UnaryClient(grpc::testing::EchoTestService::Stub* stub) {
       cli_ctx_.AddMetadata("key1", "val1");
       cli_ctx_.AddMetadata("key2", "val2");
       request_.mutable_param()->set_echo_metadata_initially(true);
@@ -842,7 +817,7 @@ TEST_P(ClientCallbackEnd2endTest, UnaryReactor) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -907,7 +882,7 @@ TEST_P(ClientCallbackEnd2endTest, GenericUnaryReactor) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1017,7 +992,7 @@ TEST_P(ClientCallbackEnd2endTest, ResponseStream) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1036,7 +1011,7 @@ TEST_P(ClientCallbackEnd2endTest, ResponseStreamServerCancelBefore) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1047,7 +1022,7 @@ TEST_P(ClientCallbackEnd2endTest, ResponseStreamServerCancelDuring) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1059,7 +1034,7 @@ TEST_P(ClientCallbackEnd2endTest, ResponseStreamServerCancelAfter) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1225,7 +1200,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStream) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1237,7 +1212,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamFirstWriteAsync) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1249,7 +1224,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamCorked) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1261,7 +1236,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamCorkedFirstWriteAsync) {
   test.Await();
   // Make sure that the server interceptors were not notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(0, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(0, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1274,7 +1249,7 @@ TEST_P(ClientCallbackEnd2endTest, ClientCancelsBidiStream) {
   test.Await();
   // Make sure that the server interceptors were notified of a cancel
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1286,7 +1261,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamServerCancelBefore) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1300,7 +1275,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamServerCancelDuring) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1313,7 +1288,7 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamServerCancelAfter) {
   test.Await();
   // Make sure that the server interceptors were notified
   if (GetParam().use_interceptors) {
-    EXPECT_EQ(20, DummyInterceptor::GetNumTimesCancel());
+    EXPECT_EQ(20, PhonyInterceptor::GetNumTimesCancel());
   }
 }
 
@@ -1322,7 +1297,7 @@ TEST_P(ClientCallbackEnd2endTest, SimultaneousReadAndWritesDone) {
   class Client : public grpc::experimental::ClientBidiReactor<EchoRequest,
                                                               EchoResponse> {
    public:
-    Client(grpc::testing::EchoTestService::Stub* stub) {
+    explicit Client(grpc::testing::EchoTestService::Stub* stub) {
       request_.set_message("Hello bidi ");
       stub->experimental_async()->BidiStream(&context_, this);
       StartWrite(&request_);
@@ -1403,7 +1378,8 @@ TEST_P(ClientCallbackEnd2endTest,
   class ReadAllIncomingDataClient
       : public grpc::experimental::ClientReadReactor<EchoResponse> {
    public:
-    ReadAllIncomingDataClient(grpc::testing::EchoTestService::Stub* stub) {
+    explicit ReadAllIncomingDataClient(
+        grpc::testing::EchoTestService::Stub* stub) {
       request_.set_message("Hello client ");
       stub->experimental_async()->ResponseStream(&context_, &request_, this);
     }
@@ -1527,5 +1503,8 @@ INSTANTIATE_TEST_SUITE_P(ClientCallbackEnd2endTest, ClientCallbackEnd2endTest,
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   grpc::testing::TestEnvironment env(argc, argv);
-  return RUN_ALL_TESTS();
+  grpc_init();
+  int ret = RUN_ALL_TESTS();
+  grpc_shutdown();
+  return ret;
 }

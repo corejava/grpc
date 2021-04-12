@@ -37,7 +37,6 @@
 #include "src/core/lib/iomgr/ev_epollex_linux.h"
 #include "src/core/lib/iomgr/ev_poll_posix.h"
 #include "src/core/lib/iomgr/internal_errqueue.h"
-#include "src/core/lib/iomgr/iomgr.h"
 
 GPR_GLOBAL_CONFIG_DEFINE_STRING(
     grpc_poll_strategy, "all",
@@ -90,7 +89,7 @@ namespace {
 
 grpc_poll_function_type real_poll_function;
 
-int dummy_poll(struct pollfd fds[], nfds_t nfds, int timeout) {
+int phony_poll(struct pollfd fds[], nfds_t nfds, int timeout) {
   if (timeout == 0) {
     return real_poll_function(fds, nfds, 0);
   } else {
@@ -104,11 +103,10 @@ const grpc_event_engine_vtable* init_non_polling(bool explicit_request) {
   if (!explicit_request) {
     return nullptr;
   }
-  // return the simplest engine as a dummy but also override the poller
+  // return the simplest engine as a phony but also override the poller
   auto ret = grpc_init_poll_posix(explicit_request);
   real_poll_function = grpc_poll_function;
-  grpc_poll_function = dummy_poll;
-  grpc_iomgr_mark_non_polling_internal();
+  grpc_poll_function = phony_poll;
 
   return ret;
 }
